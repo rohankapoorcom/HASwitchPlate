@@ -14,9 +14,16 @@ from typing import List
 
 import voluptuous as vol
 
-from homeassistant.components import mqtt
-from homeassistant.core import callback
 import homeassistant.helpers.config_validation as cv
+from homeassistant.components import mqtt, binary_sensor, light, sensor
+from homeassistant.components.light.mqtt import CONF_BRIGHTNESS_COMMAND_TOPIC, CONF_BRIGHTNESS_STATE_TOPIC
+from homeassistant.components.mqtt import CONF_COMMAND_TOPIC, CONF_STATE_TOPIC, CONF_AVAILABILITY_TOPIC, \
+    CONF_PAYLOAD_AVAILABLE, CONF_PAYLOAD_NOT_AVAILABLE
+from homeassistant.components.sensor.command_line import CONF_JSON_ATTRIBUTES
+from homeassistant.const import CONF_NAME, CONF_PLATFORM, CONF_PAYLOAD_ON, CONF_PAYLOAD_OFF, CONF_DEVICE_CLASS, \
+    CONF_VALUE_TEMPLATE
+from homeassistant.core import callback
+from homeassistant.helpers import discovery
 from homeassistant.helpers.typing import HomeAssistantType
 
 _LOGGER = logging.getLogger(__name__)
@@ -39,6 +46,9 @@ CONFIG_SCHEMA = vol.Schema({
 
 COMMAND_TOPIC_TEMPLATE = '{prefix}/{node}/command/'
 STATE_TOPIC_TEMPLATE = '{prefix}/{node}/state/#'
+LIGHT_TOPIC_TEMPLATE = '{prefix}/{node}/light/'
+BRIGHTNESS_TOPIC_TEMPLATE = '{prefix}/{node}/brightness/'
+AVAILABILITY_TOPIC_TEMPLATE = '{prefix}/{node}/status'
 
 PAYLOAD_ON = 'ON'
 PAYLOAD_OFF = 'OFF'
@@ -59,6 +69,9 @@ DEFAULT_FONT_PLACEHOLDER = -1
 
 SERVICE_UPDATE_COLORS = 'update_colors'
 SERVICE_UPDATE_MESSAGE = 'update_message'
+
+ENTITY = 'entity'
+COMPONENT = 'component'
 
 
 class HASwitchPlate:
@@ -166,26 +179,88 @@ async def _register_services(hass, topic_prefix):
 
 
 @asyncio.coroutine
+async def initialize_nodes(devices: List[HASwitchPlate]) -> bool:
+    for device in devices:
+        await device.subscribe()
+    return True
+
+
+@asyncio.coroutine
 async def async_setup(hass, config):
     """Set up the HASwitchPlate."""
 
-    config = config.get(DOMAIN)
+    config: dict = config.get(DOMAIN)
     topic_prefix: str = config.get(CONF_TOPIC_PREFIX)
     nodes: List[str] = config.get(CONF_NODE_NAME)
 
     devices: List[HASwitchPlate] = []
+    entities: List[dict] = []
+
     for node in nodes:
         command_topic = COMMAND_TOPIC_TEMPLATE.format(prefix=topic_prefix, node=node)
         state_topic = STATE_TOPIC_TEMPLATE.format(prefix=topic_prefix, node=node)
         devices.append(HASwitchPlate(hass, node, command_topic, state_topic))
 
-    init = await initialize_nodes(devices)
-    register = await _register_services(hass, topic_prefix)
+        light_topic_prefix = LIGHT_TOPIC_TEMPLATE.format(prefix=topic_prefix, node=node)
+        brightness_topic_prefix = BRIGHTNESS_TOPIC_TEMPLATE.format(prefix=topic_prefix, node=node)
+        availability_topic = AVAILABILITY_TOPIC_TEMPLATE.format(prefix=topic_prefix, node=node)
+        entities.append({
+            ENTITY: {
+                CONF_PLATFORM: mqtt.DOMAIN,
+                CONF_NAME: '{node_name} Backlight'.format(node_name=node),
+                CONF_COMMAND_TOPIC: '{}switch'.format(light_topic_prefix),
+                CONF_STATE_TOPIC: '{}status'.format(light_topic_prefix),
+                CONF_BRIGHTNESS_COMMAND_TOPIC: '{}set'.format(brightness_topic_prefix),
+                CONF_BRIGHTNESS_STATE_TOPIC: '{}status'.format(brightness_topic_prefix),
+                CONF_AVAILABILITY_TOPIC: availability_topic,
+                CONF_PAYLOAD_AVAILABLE: PAYLOAD_ON,
+                CONF_PAYLOAD_NOT_AVAILABLE: PAYLOAD_OFF
+            },
+            COMPONENT: light.DOMAIN,
+            CONF_PLATFORM: mqtt.DOMAIN
+        })
 
-    return init and register
+        entities.append({
+            ENTITY: {
+                CONF_PLATFORM: mqtt.DOMAIN,
+                CONF_NAME: '{node_name} Connected'.format(node_name=node),
+                CONF_DEVICE_CLASS: 'connectivity',
+                CONF_STATE_TOPIC: availability_topic,
+                CONF_PAYLOAD_ON: PAYLOAD_ON,
+                CONF_PAYLOAD_OFF: PAYLOAD_OFF,
+                CONF_AVAILABILITY_TOPIC: availability_topic,
+                CONF_PAYLOAD_AVAILABLE: PAYLOAD_ON,
+                CONF_PAYLOAD_NOT_AVAILABLE: PAYLOAD_OFF
+            },
+            COMPONENT: binary_sensor.DOMAIN,
+            CONF_PLATFORM: mqtt.DOMAIN
+        })
 
+        entities.append({
+            ENTITY: {
+                CONF_PLATFORM: mqtt.DOMAIN,
+                CONF_NAME: '{node_name} Sensor'.format(node_name=node),
+                CONF_STATE_TOPIC: '{prefix}/{node}/sensor'.format(prefix=topic_prefix, node=node),
+                CONF_VALUE_TEMPLATE: '{{ value_json.status }}',
+                CONF_JSON_ATTRIBUTES: [
+                    'espVersion',
+                    'updateESPAvailable',
+                    'lcdVersion',
+                    'updateLcdAvailable',
+                    'espUptime',
+                    'signalStrength',
+                    'haspIP'
+                ]
+            },
+            COMPONENT: sensor.DOMAIN,
+            CONF_PLATFORM: mqtt.DOMAIN
+        })
 
-async def initialize_nodes(devices: List[HASwitchPlate]) -> bool:
-    for device in devices:
-        await device.subscribe()
-    return True
+    initialized_nodes: bool = await initialize_nodes(devices)
+
+    for entity in entities:
+        discovery.load_platform(hass, entity.get(COMPONENT), entity.get(CONF_PLATFORM), entity.get(ENTITY), config)
+
+    registered_services: bool = await _register_services(hass, topic_prefix)
+
+    return initialized_nodes and registered_services
